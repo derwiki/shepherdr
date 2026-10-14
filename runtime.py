@@ -80,6 +80,11 @@ def runtime_status(store: Store, request_id: str) -> dict[str, Any]:
                 "error",
             ):
                 result[key] = run[key]
+            stored = store.one(
+                "SELECT result_json FROM job_results WHERE run_id=?", (run["run_id"],)
+            )
+            if stored:
+                result["result"] = json.loads(stored["result_json"])
             session = store.one(
                 "SELECT thread_ts FROM sessions WHERE session_id=?",
                 (run["session_id"],),

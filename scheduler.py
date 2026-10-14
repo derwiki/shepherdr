@@ -260,6 +260,20 @@ class Scheduler:
             if job.mode != "runtime":
                 continue
             state = "started" if run["state"] in {"submitted", "done"} else run["state"]
+            if self.bridge.slack is None:
+                # Without Slack the monitor logs every transition, so the log
+                # records the real state instead of the single launch notice.
+                if self.store.one(
+                    "SELECT 1 FROM job_notices WHERE run_id=? AND state=?",
+                    (run["run_id"], run["state"]),
+                ):
+                    continue
+                LOG.info("Runtime %s: %s", job.display_name, run["state"])
+                self.store.write(
+                    "INSERT OR IGNORE INTO job_notices VALUES (?,?,?)",
+                    (run["run_id"], run["state"], ""),
+                )
+                continue
             if self.store.one(
                 "SELECT 1 FROM job_notices WHERE run_id=? AND state=?",
                 (run["run_id"], state),
@@ -383,6 +397,7 @@ class Scheduler:
         turn_id = row["turn_id"]
         state = row["state"]
         offset = row["rollout_offset"]
+        answer = None
         for end, record in SessionHistories.records(path, offset):
             offset = end
             if record.get("type") != "response_item" or (
@@ -412,7 +427,13 @@ class Scheduler:
                 and metadata.get("turn_id") == turn_id
             ):
                 state = "done"
+                answer = message_text(payload)
                 break
+        if answer:
+            self.store.write(
+                "INSERT OR REPLACE INTO job_results VALUES (?,?)",
+                (row["run_id"], json.dumps({"answer": answer})),
+            )
         self.update(
             row["run_id"],
             state=state,

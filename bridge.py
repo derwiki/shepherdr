@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Shepherdr mirrors supported Herdr sessions to Slack and routes replies back."""
+"""Shepherdr mirrors supported Herdr sessions to Slack and routes replies back.
+
+`--slack-mode none` skips Slack entirely: the monitor only runs scheduled and
+runtime jobs, and those are followed through `shepherdr runtime --status`.
+"""
 
 from __future__ import annotations
 
@@ -628,10 +632,10 @@ class Bridge:
         self,
         herdr: HerdrClient,
         rollouts: CodexRollouts,
-        slack: SlackApi,
+        slack: SlackApi | None,
         store: Store,
-        channel: str,
-        user_id: str,
+        channel: str | None,
+        user_id: str | None,
         backfill: bool = False,
         search: Any = None,
         activity_notices: bool = False,
@@ -642,7 +646,8 @@ class Bridge:
         self.store = store
         self.channel = channel
         self.user_id = user_id
-        self.store.bind(channel, user_id)
+        if slack is not None:
+            self.store.bind(channel, user_id)
         self.backfill = backfill
         self.bootstrap_complete = bool(self.store.one("SELECT 1 FROM sessions LIMIT 1"))
         self.search = search
@@ -700,6 +705,8 @@ class Bridge:
         client_msg_id: str,
         markdown: bool = False,
     ) -> str:
+        if self.slack is None:
+            raise RuntimeError("This monitor runs without Slack")
         return self.slack.post(
             text,
             thread_ts=thread_ts,
@@ -1106,6 +1113,15 @@ class Bridge:
 
     def tick(self, reconcile_interval: float = 5) -> None:
         agents = self.herdr.agents()
+        if self.slack is None:
+            # Without Slack there is no thread to mirror, no remote reply to
+            # deliver, and no idle session to resume from Slack, so only Codex
+            # error recovery and the scheduler act.
+            if self.recovery is not None:
+                self.recovery.tick(agents)
+            if self.scheduler is not None:
+                self.scheduler.tick()
+            return
         self.sync_roots(agents)
         self.sync_rollouts({agent["session_id"] for agent in agents})
         self.poll_client_messages()
@@ -1234,7 +1250,12 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Do not post completed-turn notices in the main channel",
     )
-    parser.add_argument("--slack-mode", choices=("bot", "client"), default="bot")
+    parser.add_argument(
+        "--slack-mode",
+        choices=("bot", "client", "none"),
+        default="bot",
+        help="Slack transport; 'none' runs runtime and scheduled jobs without Slack",
+    )
     parser.add_argument(
         "--client-credentials",
         type=Path,
@@ -1336,7 +1357,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.check:
         check_local(herdr, rollouts)
         return 0
-    if not (args.channel and args.user):
+    if args.slack_mode != "none" and not (args.channel and args.user):
         parser.error(
             "Set SLACK_CHANNEL_ID and SLACK_USER_ID, or use --channel and --user"
         )
@@ -1349,39 +1370,48 @@ def main(argv: list[str] | None = None) -> int:
         store = Store(args.state)
         socket_client = None
         search = None
-        if args.slack_mode == "client":
-            if __package__:
-                from .client_slack import ClientMessageSearch, ClientWebClient
-            else:
-                from client_slack import ClientMessageSearch, ClientWebClient
-            if not args.client_credentials.is_file():
-                parser.error("Slack client credentials file is missing")
-            web = ClientWebClient(args.client_credentials)
-            identity = web.auth_test()
-            if identity.get("user_id") != args.user:
-                parser.error("The Slack client credentials belong to a different user")
-            search = ClientMessageSearch(web, args.channel)
+        slack = None
+        if args.slack_mode == "none":
+            LOG.info("Slack is disabled; runtime and scheduled jobs only")
         else:
-            if not (
-                os.environ.get("SLACK_BOT_TOKEN") and os.environ.get("SLACK_APP_TOKEN")
-            ):
-                parser.error("Set SLACK_BOT_TOKEN and SLACK_APP_TOKEN for bot mode")
-            try:
-                from slack_sdk import WebClient
-                from slack_sdk.http_retry.builtin_handlers import (
-                    RateLimitErrorRetryHandler,
+            if args.slack_mode == "client":
+                if __package__:
+                    from .client_slack import ClientMessageSearch, ClientWebClient
+                else:
+                    from client_slack import ClientMessageSearch, ClientWebClient
+                if not args.client_credentials.is_file():
+                    parser.error("Slack client credentials file is missing")
+                web = ClientWebClient(args.client_credentials)
+                identity = web.auth_test()
+                if identity.get("user_id") != args.user:
+                    parser.error(
+                        "The Slack client credentials belong to a different user"
+                    )
+                search = ClientMessageSearch(web, args.channel)
+            else:
+                if not (
+                    os.environ.get("SLACK_BOT_TOKEN")
+                    and os.environ.get("SLACK_APP_TOKEN")
+                ):
+                    parser.error("Set SLACK_BOT_TOKEN and SLACK_APP_TOKEN for bot mode")
+                try:
+                    from slack_sdk import WebClient
+                    from slack_sdk.http_retry.builtin_handlers import (
+                        RateLimitErrorRetryHandler,
+                    )
+                    from slack_sdk.socket_mode import SocketModeClient
+                    from slack_sdk.socket_mode.response import SocketModeResponse
+                except ImportError as error:
+                    parser.error(
+                        f"Install Shepherdr dependencies with uv sync: {error}"
+                    )
+                web = WebClient(
+                    token=os.environ["SLACK_BOT_TOKEN"],
+                    retry_handlers=[RateLimitErrorRetryHandler(max_retry_count=3)],
                 )
-                from slack_sdk.socket_mode import SocketModeClient
-                from slack_sdk.socket_mode.response import SocketModeResponse
-            except ImportError as error:
-                parser.error(f"Install Shepherdr dependencies with uv sync: {error}")
-            web = WebClient(
-                token=os.environ["SLACK_BOT_TOKEN"],
-                retry_handlers=[RateLimitErrorRetryHandler(max_retry_count=3)],
-            )
-            identity = web.auth_test()
-        store.bind(args.channel, args.user, workspace_url=identity.get("url"))
-        slack = SlackApi(web, args.channel)
+                identity = web.auth_test()
+            store.bind(args.channel, args.user, workspace_url=identity.get("url"))
+            slack = SlackApi(web, args.channel)
         bridge = Bridge(
             herdr,
             rollouts,
@@ -1393,16 +1423,19 @@ def main(argv: list[str] | None = None) -> int:
             search,
             activity_notices=not args.no_activity_notices,
         )
-        if __package__:
-            from .suspender import Suspender
-        else:
-            from suspender import Suspender
-        bridge.suspender = Suspender(
-            bridge,
-            idle_seconds=args.suspend_idle_days * 86400
-            if args.suspend_idle_days
-            else float("inf"),
-        )
+        if slack is not None:
+            # Suspended sessions resume from a Slack reply, so suspension needs
+            # a Slack monitor.
+            if __package__:
+                from .suspender import Suspender
+            else:
+                from suspender import Suspender
+            bridge.suspender = Suspender(
+                bridge,
+                idle_seconds=args.suspend_idle_days * 86400
+                if args.suspend_idle_days
+                else float("inf"),
+            )
         if not args.no_auto_retry:
             if __package__:
                 from .recovery import Recovery
@@ -1443,7 +1476,10 @@ def main(argv: list[str] | None = None) -> int:
 
             socket_client.socket_mode_request_listeners.append(on_slack_request)
             socket_client.connect()
-        LOG.info("Shepherdr started for channel %s", args.channel)
+        if slack is None:
+            LOG.info("Shepherdr started without Slack")
+        else:
+            LOG.info("Shepherdr started for channel %s", args.channel)
         try:
             while True:
                 started = time.monotonic()
